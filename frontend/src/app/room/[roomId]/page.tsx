@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import io, { Socket } from 'socket.io-client';
 
@@ -22,7 +22,8 @@ interface User {
   isTyping?: boolean;
 }
 
-const BACKEND_URL = 'http://192.168.30.21:5000';  // 👈 Your IP address
+const BACKEND_URL = 'http://192.168.30.21:5000';
+
 export default function RoomPage() {
   const params = useParams();
   const router = useRouter();
@@ -41,117 +42,27 @@ export default function RoomPage() {
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const socketRef = useRef<Socket | null>(null); // Add ref to track socket
+  const messageIdsRef = useRef<Set<string>>(new Set()); // Track message IDs to prevent duplicates
 
-  useEffect(() => {
-    if (!roomId) return;
-    
-    initializeRoom();
-    return () => {
-      if (socket) {
-        socket.disconnect();
-      }
-    };
-  }, [roomId]);
+  // Memoize the scroll function
+  const scrollToBottom = useCallback(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, []);
 
-  const initializeRoom = async () => {
-    try {
-      setIsLoading(true);
-      setError('');
-
-      // Check if room exists
-      const roomResponse = await fetch(`${BACKEND_URL}/api/rooms/${roomId}`);
-      const roomData = await roomResponse.json();
-
-      if (!roomData.success) {
-        setError('Room not found. Please check the room ID.');
-        setIsLoading(false);
-        return;
-      }
-
-      setRoomInfo(roomData.room);
-
-      // Load recent messages
-      const messagesResponse = await fetch(`${BACKEND_URL}/api/messages/${roomId}?limit=50`);
-      const messagesData = await messagesResponse.json();
-      
-      if (messagesData.success) {
-        setMessages(messagesData.messages || []);
-      }
-
-      // Initialize socket connection
-      const newSocket = io(BACKEND_URL, {
-        transports: ['websocket', 'polling']
-      });
-
-      newSocket.on('connect', () => {
-        console.log('Connected to server');
-        setIsConnected(true);
-        
-        // Join room
-        newSocket.emit('joinRoom', {
-          roomId: roomId,
-          username: '' // Will be auto-generated
-        });
-      });
-
-      newSocket.on('disconnect', () => {
-        console.log('Disconnected from server');
-        setIsConnected(false);
-      });
-
-      newSocket.on('joinedRoom', (data) => {
-        console.log('Joined room:', data);
-        setCurrentUser(data.username);
-        setUsers(data.users || []);
-        setIsLoading(false);
-      });
-
-      newSocket.on('newMessage', (message: Message) => {
-        setMessages(prev => [...prev, message]);
-        scrollToBottom();
-      });
-
-      newSocket.on('userJoined', (data) => {
-        if (data.message) {
-          setMessages(prev => [...prev, data.message]);
-        }
-        // Update users list
-        fetchRoomInfo();
-      });
-
-      newSocket.on('userLeft', (data) => {
-        if (data.message) {
-          setMessages(prev => [...prev, data.message]);
-        }
-        // Update users list
-        fetchRoomInfo();
-      });
-
-      newSocket.on('userTyping', (data) => {
-        if (data.isTyping) {
-          setTypingUsers(prev => 
-            prev.includes(data.username) ? prev : [...prev, data.username]
-          );
-        } else {
-          setTypingUsers(prev => prev.filter(user => user !== data.username));
-        }
-      });
-
-      newSocket.on('error', (data) => {
-        console.error('Socket error:', data);
-        setError(data.message || 'An error occurred');
-      });
-
-      setSocket(newSocket);
-
-    } catch (err) {
-      console.error('Error initializing room:', err);
-      setError('Failed to connect to server. Please try again.');
-      setIsLoading(false);
+  // Memoized function to add message with duplicate prevention
+  const addMessage = useCallback((message: Message) => {
+    if (messageIdsRef.current.has(message.id)) {
+      console.log('Duplicate message detected, ignoring:', message.id);
+      return; // Prevent duplicate
     }
-  };
+    
+    messageIdsRef.current.add(message.id);
+    setMessages(prev => [...prev, message]);
+    scrollToBottom();
+  }, [scrollToBottom]);
 
-  const fetchRoomInfo = async () => {
+  const fetchRoomInfo = useCallback(async () => {
     try {
       const response = await fetch(`${BACKEND_URL}/api/rooms/${roomId}`);
       const data = await response.json();
@@ -161,12 +72,178 @@ export default function RoomPage() {
     } catch (err) {
       console.error('Error fetching room info:', err);
     }
-  };
+  }, [roomId]);
 
-  const sendMessage = (e: React.FormEvent) => {
+  useEffect(() => {
+    if (!roomId) return;
+    
+    let isMounted = true; // Flag to prevent state updates on unmounted component
+    
+    const initializeRoom = async () => {
+      try {
+        setIsLoading(true);
+        setError('');
+
+        // Check if room exists
+        const roomResponse = await fetch(`${BACKEND_URL}/api/rooms/${roomId}`);
+        const roomData = await roomResponse.json();
+
+        if (!roomData.success) {
+          if (isMounted) {
+            setError('Room not found. Please check the room ID.');
+            setIsLoading(false);
+          }
+          return;
+        }
+
+        if (isMounted) {
+          setRoomInfo(roomData.room);
+        }
+
+        // Load recent messages
+        const messagesResponse = await fetch(`${BACKEND_URL}/api/messages/${roomId}?limit=50`);
+        const messagesData = await messagesResponse.json();
+        
+        if (messagesData.success && isMounted) {
+          setMessages(messagesData.messages || []);
+          // Track existing message IDs
+          messageIdsRef.current = new Set(messagesData.messages?.map((m: Message) => m.id) || []);
+        }
+
+        // Disconnect existing socket if any
+        if (socketRef.current) {
+          socketRef.current.disconnect();
+          socketRef.current = null;
+        }
+
+        // Initialize socket connection
+        const newSocket = io(BACKEND_URL, {
+          transports: ['websocket', 'polling'],
+          forceNew: true, // Force new connection
+          timeout: 10000
+        });
+
+        socketRef.current = newSocket;
+
+        newSocket.on('connect', () => {
+          console.log('Connected to server');
+          if (isMounted) {
+            setIsConnected(true);
+            
+            // Join room
+            newSocket.emit('joinRoom', {
+              roomId: roomId,
+              username: '' // Will be auto-generated
+            });
+          }
+        });
+
+        newSocket.on('disconnect', () => {
+          console.log('Disconnected from server');
+          if (isMounted) {
+            setIsConnected(false);
+          }
+        });
+
+        newSocket.on('joinedRoom', (data) => {
+          console.log('Joined room:', data);
+          if (isMounted) {
+            setCurrentUser(data.username);
+            setUsers(data.users || []);
+            setIsLoading(false);
+          }
+        });
+
+        // Use the memoized addMessage function
+        newSocket.on('newMessage', (message: Message) => {
+          if (isMounted) {
+            addMessage(message);
+          }
+        });
+
+        newSocket.on('userJoined', (data) => {
+          if (isMounted) {
+            if (data.message) {
+              addMessage(data.message);
+            }
+            fetchRoomInfo();
+          }
+        });
+
+        newSocket.on('userLeft', (data) => {
+          if (isMounted) {
+            if (data.message) {
+              addMessage(data.message);
+            }
+            fetchRoomInfo();
+          }
+        });
+
+        newSocket.on('userTyping', (data) => {
+          if (isMounted) {
+            if (data.isTyping) {
+              setTypingUsers(prev => 
+                prev.includes(data.username) ? prev : [...prev, data.username]
+              );
+            } else {
+              setTypingUsers(prev => prev.filter(user => user !== data.username));
+            }
+          }
+        });
+
+        newSocket.on('error', (data) => {
+          console.error('Socket error:', data);
+          if (isMounted) {
+            setError(data.message || 'An error occurred');
+          }
+        });
+
+        if (isMounted) {
+          setSocket(newSocket);
+        }
+
+      } catch (err) {
+        console.error('Error initializing room:', err);
+        if (isMounted) {
+          setError('Failed to connect to server. Please try again.');
+          setIsLoading(false);
+        }
+      }
+    };
+
+    initializeRoom();
+
+    return () => {
+      isMounted = false;
+      if (socketRef.current) {
+        socketRef.current.disconnect();
+        socketRef.current = null;
+      }
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+        typingTimeoutRef.current = null;
+      }
+    };
+  }, [roomId, addMessage, fetchRoomInfo]);
+
+  const sendMessage = useCallback((e: React.FormEvent) => {
     e.preventDefault();
     if (!socket || !messageInput.trim()) return;
 
+    // Generate a temporary ID for optimistic UI (optional)
+    const tempMessage = {
+      id: `temp-${Date.now()}`,
+      content: messageInput.trim(),
+      sender: {
+        username: currentUser,
+        socketId: socket.id || ''
+      },
+      createdAt: new Date().toISOString(),
+      type: 'message' as const
+    };
+
+    // Don't add optimistic message to avoid duplicates
+    // Just send to server and wait for response
     socket.emit('sendMessage', {
       roomId: roomId,
       content: messageInput.trim()
@@ -174,9 +251,9 @@ export default function RoomPage() {
 
     setMessageInput('');
     stopTyping();
-  };
+  }, [socket, messageInput, roomId, currentUser]);
 
-  const handleTyping = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleTyping = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const value = e.target.value;
     setMessageInput(value);
 
@@ -194,9 +271,9 @@ export default function RoomPage() {
     typingTimeoutRef.current = setTimeout(() => {
       stopTyping();
     }, 2000);
-  };
+  }, [socket, roomId]);
 
-  const stopTyping = () => {
+  const stopTyping = useCallback(() => {
     if (socket) {
       socket.emit('typing', { roomId, isTyping: false });
     }
@@ -204,23 +281,20 @@ export default function RoomPage() {
       clearTimeout(typingTimeoutRef.current);
       typingTimeoutRef.current = null;
     }
-  };
+  }, [socket, roomId]);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
-
-  const copyRoomId = () => {
+  const copyRoomId = useCallback(() => {
     navigator.clipboard.writeText(roomId);
     alert('Room ID copied to clipboard!');
-  };
+  }, [roomId]);
 
-  const leaveRoom = () => {
-    if (socket) {
-      socket.disconnect();
+  const leaveRoom = useCallback(() => {
+    if (socketRef.current) {
+      socketRef.current.disconnect();
+      socketRef.current = null;
     }
     router.push('/');
-  };
+  }, [router]);
 
   if (isLoading) {
     return (

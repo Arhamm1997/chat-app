@@ -117,7 +117,7 @@ const socketHandler = (io) => {
           users: onlineUsers
         });
 
-        // Broadcast new message to room
+        // Broadcast new message to OTHER users only
         socket.to(normalizedRoomId).emit('newMessage', {
           id: systemMessage._id,
           content: systemMessage.content,
@@ -144,7 +144,7 @@ const socketHandler = (io) => {
       }
     });
 
-    // Handle sending messages
+    // Handle sending messages - FIXED VERSION
     socket.on('sendMessage', async (data) => {
       try {
         const { roomId, content } = data;
@@ -209,8 +209,11 @@ const socketHandler = (io) => {
           type: 'message'
         };
 
-        // Broadcast message to all users in room
-        io.to(roomId).emit('newMessage', messageData);
+        // ✅ FIXED: Send to sender first (confirmation)
+        socket.emit('newMessage', messageData);
+        
+        // ✅ FIXED: Then broadcast to OTHER users only (no duplication)
+        socket.to(roomId).emit('newMessage', messageData);
 
         console.log(`💬 ${user.username} sent message in ${roomId}: "${content.substring(0, 50)}${content.length > 50 ? '...' : ''}"`);
 
@@ -244,7 +247,7 @@ const socketHandler = (io) => {
           }
         );
 
-        // Broadcast typing status to other users in room
+        // Broadcast typing status to OTHER users only
         socket.to(roomId).emit('userTyping', {
           username: user.username,
           isTyping: isTyping
@@ -359,7 +362,7 @@ const socketHandler = (io) => {
           });
           await systemMessage.save();
 
-          // Broadcast system message to room
+          // Broadcast system message to room (others only)
           socket.to(roomId).emit('newMessage', {
             id: systemMessage._id,
             content: systemMessage.content,

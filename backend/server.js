@@ -17,69 +17,68 @@ const messageRoutes = require('./src/routes/messages');
 const app = express();
 const server = http.createServer(app);
 
-// Get local IP address
-function getLocalIPAddress() {
+// Get all local IP addresses
+function getLocalIPAddresses() {
   const interfaces = os.networkInterfaces();
+  const addresses = [];
+  
   for (const devName in interfaces) {
     const iface = interfaces[devName];
     for (let i = 0; i < iface.length; i++) {
       const alias = iface[i];
-      if (alias.family === 'IPv4' && alias.address !== '127.0.0.1' && !alias.internal) {
-        return alias.address;
+      if (alias.family === 'IPv4' && !alias.internal) {
+        addresses.push(alias.address);
       }
     }
   }
-  return 'localhost';
+  return addresses;
 }
 
-const LOCAL_IP = getLocalIPAddress();
+const LOCAL_IPS = getLocalIPAddresses();
+const PRIMARY_IP = LOCAL_IPS[0] || 'localhost';
 const PORT = process.env.PORT || 5000;
 
-// CORS configuration - Allow local network access
+console.log('🌐 Available Network IPs:', LOCAL_IPS);
+
+// Very permissive CORS for local network
 const corsOptions = {
-  origin: [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    `http://${LOCAL_IP}:3000`,
-    "http://192.168.1.*:3000", // Common router IP range
-    "http://192.168.0.*:3000", // Common router IP range  
-    "http://10.0.0.*:3000",    // Common router IP range
-    /^http:\/\/192\.168\.\d{1,3}\.\d{1,3}:3000$/, // Any 192.168.x.x
-    /^http:\/\/10\.\d{1,3}\.\d{1,3}\.\d{1,3}:3000$/, // Any 10.x.x.x
-  ],
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, Postman, etc.)
+    if (!origin) return callback(null, true);
+    
+    // Allow localhost and 127.0.0.1
+    if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
+      return callback(null, true);
+    }
+    
+    // Allow any local network IP
+    const isLocalNetwork = LOCAL_IPS.some(ip => origin.includes(ip)) ||
+                          /^https?:\/\/(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(origin);
+    
+    callback(null, isLocalNetwork);
+  },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "x-api-key", "x-admin-key"],
-  credentials: true,
+  credentials: false, // Set to false for easier local access
   optionsSuccessStatus: 200
 };
 
-// Socket.IO setup with CORS for local network
+// Socket.IO with very permissive CORS
 const io = socketIo(server, {
   cors: {
-    origin: [
-      "http://localhost:3000",
-      "http://127.0.0.1:3000",
-      `http://${LOCAL_IP}:3000`,
-      /^http:\/\/192\.168\.\d{1,3}\.\d{1,3}:3000$/,
-      /^http:\/\/10\.\d{1,3}\.\d{1,3}\.\d{1,3}:3000$/,
-    ],
+    origin: function (origin, callback) {
+      callback(null, true); // Allow all origins for local development
+    },
     methods: ["GET", "POST"],
-    credentials: true,
+    credentials: false,
     allowEIO3: true
   },
   transports: ['websocket', 'polling'],
   allowRequest: (req, callback) => {
-    // Allow all local network requests
-    const origin = req.headers.origin;
-    const isLocalNetwork = !origin || 
-      origin.includes('localhost') || 
-      origin.includes('127.0.0.1') ||
-      origin.includes('192.168.') ||
-      origin.includes('10.0.') ||
-      origin.includes(LOCAL_IP);
-    
-    callback(null, isLocalNetwork);
-  }
+    callback(null, true); // Allow all requests
+  },
+  pingTimeout: 60000,
+  pingInterval: 25000
 });
 
 // Connect to MongoDB
@@ -90,9 +89,10 @@ app.use(cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Request logging middleware
+// Enhanced request logging
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} from ${req.ip}`);
+  const clientIP = req.ip || req.connection.remoteAddress || req.headers['x-forwarded-for'];
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} from ${clientIP}`);
   next();
 });
 
@@ -102,24 +102,42 @@ app.get('/health', (req, res) => {
     status: 'OK', 
     timestamp: new Date().toISOString(),
     database: mongoose.connection.readyState === 1 ? 'Connected' : 'Disconnected',
-    localIP: LOCAL_IP,
-    port: PORT
+    localIPs: LOCAL_IPS,
+    primaryIP: PRIMARY_IP,
+    port: PORT,
+    accessURLs: LOCAL_IPS.map(ip => `http://${ip}:${PORT}`)
   });
 });
 
-// Test route to check if server is working
+// Main route with network info
 app.get('/', (req, res) => {
   res.json({
     message: 'Anonymous Chat Backend Server is running!',
     version: '1.0.0',
-    localIP: LOCAL_IP,
-    accessURL: `http://${LOCAL_IP}:${PORT}`,
+    networkInfo: {
+      localIPs: LOCAL_IPS,
+      primaryIP: PRIMARY_IP,
+      accessURLs: LOCAL_IPS.map(ip => `http://${ip}:${PORT}`),
+      frontendURLs: LOCAL_IPS.map(ip => `http://${ip}:3000`)
+    },
     endpoints: {
       health: '/health',
       createRoom: 'POST /api/rooms/create',
       getRoomInfo: 'GET /api/rooms/:roomId',
       getRoomMessages: 'GET /api/messages/:roomId'
     }
+  });
+});
+
+// Network info endpoint
+app.get('/network', (req, res) => {
+  res.json({
+    success: true,
+    localIPs: LOCAL_IPS,
+    primaryIP: PRIMARY_IP,
+    backendURLs: LOCAL_IPS.map(ip => `http://${ip}:${PORT}`),
+    frontendURLs: LOCAL_IPS.map(ip => `http://${ip}:3000`),
+    shareMessage: `Share these URLs with others on your WiFi network:\n${LOCAL_IPS.map(ip => `Frontend: http://${ip}:3000`).join('\n')}`
   });
 });
 
@@ -147,6 +165,7 @@ app.use('*', (req, res) => {
     error: 'Route not found',
     availableEndpoints: {
       health: 'GET /health',
+      network: 'GET /network',
       createRoom: 'POST /api/rooms/create',
       getRoomInfo: 'GET /api/rooms/:roomId'
     }
@@ -154,10 +173,22 @@ app.use('*', (req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`\n🚀 Anonymous Chat Server Started Successfully!`);
   console.log(`📡 Socket.IO server ready for connections`);
-  console.log(`🌐 Local access: http://localhost:${PORT}`);
-  console.log(`🌐 Network access: http://${LOCAL_IP}:${PORT}`);
-  console.log(`🔗 Share this URL with others on your WiFi: http://${LOCAL_IP}:${PORT}`);
-  console.log(`📊 Health check: http://${LOCAL_IP}:${PORT}/health`);
+  console.log(`🔗 Access URLs:`);
+  console.log(`   Local: http://localhost:${PORT}`);
+  
+  LOCAL_IPS.forEach(ip => {
+    console.log(`   Network: http://${ip}:${PORT}`);
+  });
+  
+  console.log(`\n📱 Share these URLs for WiFi access:`);
+  LOCAL_IPS.forEach(ip => {
+    console.log(`   Frontend: http://${ip}:3000`);
+    console.log(`   Backend: http://${ip}:${PORT}`);
+  });
+  
+  console.log(`\n📊 Health check: http://${PRIMARY_IP}:${PORT}/health`);
+  console.log(`🌐 Network info: http://${PRIMARY_IP}:${PORT}/network`);
+  console.log(`\n✅ Server ready to accept connections from same WiFi network!`);
 });
